@@ -60,6 +60,20 @@ public class JobManager {
         }
     }
 
+    /**
+     * 특정 직업의 도우미 목록을 반환합니다.
+     */
+    public Set<UUID> getHelpers(JobType job) {
+        return helpers.getOrDefault(job, Collections.emptySet());
+    }
+
+    /**
+     * 특정 직업의 도우미 수를 반환합니다.
+     */
+    public int getHelperCount(JobType job) {
+        return helpers.getOrDefault(job, Collections.emptySet()).size();
+    }
+
     // 게임 시작 시 랜덤 직업 배분
     public void assignJobs(List<Player> players) {
         List<JobType> jobs = new ArrayList<>(pool);
