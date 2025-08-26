@@ -24,8 +24,7 @@ import yd.kingdom.escapePlugin.job.JobType;
 import yd.kingdom.escapePlugin.region.Region;
 import yd.kingdom.escapePlugin.region.RegionManager;
 
-import java.util.Optional;
-import java.util.UUID;
+import java.util.*;
 
 public class StealItemListener implements Listener {
     private UUID acting = null;
@@ -101,19 +100,44 @@ public class StealItemListener implements Listener {
         JobType actorJobOld  = jm.getJob(actorId);
         JobType targetJobOld = jm.getJob(target.getUniqueId());
 
-        // 1) 직업 스왑 (이 부분은 스레드 세이프)
+        // 1) 도우미 목록을 먼저 저장 (직업 변경 전에)
+        Set<UUID> actorHelpers = new HashSet<>(jm.getHelpers(actorJobOld));
+        Set<UUID> targetHelpers = new HashSet<>(jm.getHelpers(targetJobOld));
+
+        // 2) 직업 스왑 (이 부분은 스레드 세이프)
         jm.setJob(actorId, targetJobOld);
         jm.setJob(target.getUniqueId(), actorJobOld);
 
-        // 2) 실제 블록/인벤토리 작업과 메시지 전송은 메인 스레드로 옮기기
-        Bukkit.getScheduler().runTask(EscapePlugin.getInstance(), () -> {
-            depositItems(actor, actorJobOld);
-            depositItems(target, targetJobOld);
+        // 3) 도우미들의 직업도 함께 변경
+        swapHelpers(jm, actorJobOld, targetJobOld, actorHelpers, targetHelpers);
 
+        // 3) 실제 블록/인벤토리 작업과 메시지 전송은 메인 스레드로 옮기기
+        Bukkit.getScheduler().runTask(EscapePlugin.getInstance(), () -> {
+            // 기존 방식: 개별 플레이어의 아이템만 상자로 이동
+            // depositItems(actor, actorJobOld);
+            // depositItems(target, targetJobOld);
+            
+            // 새로운 방식: 아이템을 이전 직업의 상자로 이동
+            // A(농부→광부)의 아이템은 농부 상자로, B(광부→농부)의 아이템은 광부 상자로
+            
+            // A 영역의 모든 사람들(노동자 + 도우미)의 아이템을 농부 상자로
+            Set<UUID> actorRegionPlayers = new HashSet<>(actorHelpers);
+            actorRegionPlayers.add(actorId);  // A 플레이어 추가
+            depositAllRegionItems(actorJobOld, actorRegionPlayers);
+            
+            // B 영역의 모든 사람들(노동자 + 도우미)의 아이템을 광부 상자로
+            Set<UUID> targetRegionPlayers = new HashSet<>(targetHelpers);
+            targetRegionPlayers.add(target.getUniqueId());  // B 플레이어 추가
+            depositAllRegionItems(targetJobOld, targetRegionPlayers);
+
+            // 메인 플레이어들의 메시지
             actor.sendMessage("§a당신과 " + target.getName() + "님의 직업이 서로 변경되었습니다");
             actor.sendMessage(actor.getName() + "님의 새로운 직업은 §e" + targetJobOld.getDisplayName() + "§f입니다.");
             target.sendMessage("§a당신과 " + actor.getName() + "님의 직업이 서로 변경되었습니다");
             target.sendMessage(target.getName() + "님의 새로운 직업은 §e" + actorJobOld.getDisplayName() + "§f입니다.");
+            
+            // 도우미 변경 메시지 전송
+            sendHelperChangeMessages(jm, actorJobOld, targetJobOld, actorHelpers, targetHelpers);
             
             // 성공적으로 완료되었으므로 소모된 아이템 초기화
             consumedItem = null;
@@ -133,6 +157,121 @@ public class StealItemListener implements Listener {
         }
     }
 
+    /**
+     * 해당 영역에 소속된 모든 플레이어(영역 권한 있는 노동자 + 영역에 속한 도우미)의 
+     * 아이템을 상자로 이동시킵니다.
+     */
+    private void depositAllRegionItems(JobType job) {
+        RegionManager rm = EscapePlugin.getInstance().getRegionManager();
+        Optional<Region> opt = rm.getByJob(job);
+        if (opt.isEmpty()) return;
+
+        Region region = opt.get();
+        Location chestLoc = region.getChestLocation();
+        BlockState bs = chestLoc.getBlock().getState();
+        if (!(bs instanceof Chest chest)) return;
+
+        JobManager jm = EscapePlugin.getInstance().getJobManager();
+        Set<UUID> affectedPlayers = new HashSet<>();
+
+        // 1. 해당 직업을 가진 플레이어들 (영역 권한 있는 노동자)
+        for (Player player : Bukkit.getOnlinePlayers()) {
+            if (jm.getJob(player.getUniqueId()) == job) {
+                affectedPlayers.add(player.getUniqueId());
+            }
+        }
+
+        // 2. 해당 직업 영역의 도우미들
+        Set<UUID> helpers = jm.getHelpers(job);
+        if (helpers != null) {
+            affectedPlayers.addAll(helpers);
+        }
+
+        // 3. 모든 영향받는 플레이어의 아이템을 상자로 이동
+        for (UUID playerId : affectedPlayers) {
+            Player player = Bukkit.getPlayer(playerId);
+            if (player != null && player.isOnline()) {
+                depositPlayerItems(player, chest);
+            }
+        }
+
+        // 4. 결과 메시지 전송
+        if (!affectedPlayers.isEmpty()) {
+            String message = String.format("§e%s 영역에 소속된 %d명의 플레이어 아이템이 상자로 이동되었습니다.", 
+                job.getDisplayName(), affectedPlayers.size());
+            
+            for (UUID playerId : affectedPlayers) {
+                Player player = Bukkit.getPlayer(playerId);
+                if (player != null && player.isOnline()) {
+                    player.sendMessage(message);
+                }
+            }
+        }
+    }
+
+    /**
+     * 지정된 플레이어들의 아이템을 특정 직업 영역의 상자로 이동시킵니다.
+     * 강탈권 사용 시 새로 받은 직업의 상자로 아이템을 이동할 때 사용합니다.
+     */
+    private void depositAllRegionItems(JobType job, Set<UUID> affectedPlayers) {
+        RegionManager rm = EscapePlugin.getInstance().getRegionManager();
+        Optional<Region> opt = rm.getByJob(job);
+        if (opt.isEmpty()) return;
+
+        Region region = opt.get();
+        Location chestLoc = region.getChestLocation();
+        BlockState bs = chestLoc.getBlock().getState();
+        if (!(bs instanceof Chest chest)) return;
+
+        // 모든 영향받는 플레이어의 아이템을 상자로 이동
+        for (UUID playerId : affectedPlayers) {
+            Player player = Bukkit.getPlayer(playerId);
+            if (player != null && player.isOnline()) {
+                depositPlayerItems(player, chest);
+            }
+        }
+
+        // 결과 메시지 전송
+        if (!affectedPlayers.isEmpty()) {
+            String message = String.format("§e%s 영역의 상자로 %d명의 플레이어 아이템이 이동되었습니다.", 
+                job.getDisplayName(), affectedPlayers.size());
+            
+            for (UUID playerId : affectedPlayers) {
+                Player player = Bukkit.getPlayer(playerId);
+                if (player != null && player.isOnline()) {
+                    player.sendMessage(message);
+                }
+            }
+        }
+    }
+
+    /**
+     * 개별 플레이어의 아이템을 상자로 이동시킵니다.
+     */
+    private void depositPlayerItems(Player player, Chest chest) {
+        PlayerInventory inv = player.getInventory();
+        int movedCount = 0;
+        
+        for (ItemStack is : inv.getContents()) {
+            if (is == null) continue;
+            
+            // 제외할 아이템들 체크
+            if (shouldExcludeItem(is)) continue;
+
+            // 상자로 아이템 이동
+            chest.getBlockInventory().addItem(is);
+            inv.remove(is);
+            movedCount++;
+        }
+        
+        if (movedCount > 0) {
+            player.sendMessage("§e" + movedCount + "개의 아이템이 상자로 이동되었습니다.");
+        }
+    }
+
+    /**
+     * 기존 방식: 개별 플레이어의 아이템만 상자로 이동 (하위 호환성 유지)
+     */
     private void depositItems(Player player, JobType oldJob) {
         RegionManager rm = EscapePlugin.getInstance().getRegionManager();
         Optional<Region> opt = rm.getByJob(oldJob);
@@ -185,6 +324,50 @@ public class StealItemListener implements Listener {
         if (consumedItem != null) {
             player.getInventory().addItem(consumedItem);
             consumedItem = null;  // 복원 후 초기화
+        }
+    }
+
+    /**
+     * 도우미들의 직업을 변경합니다.
+     */
+    private void swapHelpers(JobManager jm, JobType oldJob, JobType newJob, Set<UUID> oldHelpers, Set<UUID> newHelpers) {
+        // 1. 기존 도우미들의 직업을 새로운 직업으로 변경
+        if (oldHelpers != null && !oldHelpers.isEmpty()) {
+            for (UUID helperId : oldHelpers) {
+                jm.setJob(helperId, newJob);
+            }
+        }
+
+        // 2. 새로운 도우미들의 직업을 기존 직업으로 변경
+        if (newHelpers != null && !newHelpers.isEmpty()) {
+            for (UUID helperId : newHelpers) {
+                jm.setJob(helperId, oldJob);
+            }
+        }
+    }
+
+    /**
+     * 도우미들에게 직업 변경 메시지를 전송합니다.
+     */
+    private void sendHelperChangeMessages(JobManager jm, JobType oldJob, JobType newJob, Set<UUID> oldHelpers, Set<UUID> newHelpers) {
+        // 1. 기존 도우미들에게 메시지 전송
+        if (oldHelpers != null && !oldHelpers.isEmpty()) {
+            for (UUID helperId : oldHelpers) {
+                Player helper = Bukkit.getPlayer(helperId);
+                if (helper != null && helper.isOnline()) {
+                    helper.sendMessage("§a당신의 직업이 §e" + oldJob.getDisplayName() + "§f에서 §e" + newJob.getDisplayName() + "§f로 변경되었습니다.");
+                }
+            }
+        }
+
+        // 2. 새로운 도우미들에게 메시지 전송
+        if (newHelpers != null && !newHelpers.isEmpty()) {
+            for (UUID helperId : newHelpers) {
+                Player helper = Bukkit.getPlayer(helperId);
+                if (helper != null && helper.isOnline()) {
+                    helper.sendMessage("§a당신의 직업이 §e" + newJob.getDisplayName() + "§f에서 §e" + oldJob.getDisplayName() + "§f로 변경되었습니다.");
+                }
+            }
         }
     }
 }

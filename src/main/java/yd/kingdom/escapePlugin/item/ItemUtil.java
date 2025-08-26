@@ -30,7 +30,10 @@ public class ItemUtil {
                 lore.add(ChatColor.WHITE + "우클릭 시 직업을 강탈할 플레이어의 닉네임을 채팅창에 적습니다.");
                 lore.add(ChatColor.WHITE + "닉네임 입력 후 직업이 서로 스왑됩니다.");
                 lore.add(ChatColor.RED + "다이아몬드와 입장권만 인벤토리에 보관되고");
-                lore.add(ChatColor.RED + "나머지 직업 관련 아이템들은 상대 상자로 회수됩니다.");
+                lore.add(ChatColor.RED + "나머지 직업 관련 아이템들은 이전 직업의 상자로 회수됩니다.");
+                lore.add(ChatColor.YELLOW + "※ 해당 영역에 소속된 모든 플레이어(노동자+도우미)의");
+                lore.add(ChatColor.YELLOW + "   아이템이 이전 직업의 상자로 이동됩니다.");
+                lore.add(ChatColor.BLUE + "※ 도우미들도 함께 직업이 변경됩니다.");
             }
         }
         meta.setLore(lore);
